@@ -1,7 +1,7 @@
 import socket
 import threading
 
-from pysolarmanv5 import PySolarmanV5
+from pysolarmanv5 import CONTROL, PySolarmanV5
 import struct
 from umodbus.client.serial.redundancy_check import add_crc
 from umodbus.functions import (
@@ -75,20 +75,14 @@ class MockDatalogger(PySolarmanV5):
         :rtype: bytearray
 
         """
+        length = 14 + len(modbus_frame)
 
-        self.v5_length = struct.pack("<H", 14 + len(modbus_frame))
-        self.v5_serial = struct.pack(
+        self.v5_length = struct.pack("<H", length)
+        self.v5_seq = struct.pack(
             "<BB", self.sequence_number, self._get_next_sequence_number()
         )
-        v5_control = struct.pack("<H", 0x1510)
 
-        v5_header = bytearray(
-            self.v5_start
-            + self.v5_length
-            + v5_control
-            + self.v5_serial
-            + self.v5_loggerserial
-        )
+        v5_header = self._v5_header(length, self._get_response_code(CONTROL.REQUEST), self.v5_seq)
 
         v5_payload = bytearray(
             self.v5_frametype
@@ -99,9 +93,8 @@ class MockDatalogger(PySolarmanV5):
             + modbus_frame
         )
 
-        v5_trailer = bytearray(self.v5_checksum + self.v5_end)
-        v5_frame = v5_header + v5_payload + v5_trailer
-        v5_frame[len(v5_frame) - 2] = self._calculate_v5_frame_checksum(v5_frame)
+        v5_frame = v5_header + v5_payload + self._v5_trailer()
+        v5_frame[-2] = self._calculate_v5_frame_checksum(v5_frame)
         return v5_frame
 
 
@@ -127,7 +120,8 @@ class ServerHandler(socketserver.BaseRequestHandler):
                 self.sol.sequence_number = data[5]
                 log.debug(f"[SrvHandler] RECD: {data}")
                 data = bytearray(data)
-                data[3:5] = struct.pack("<H", 0x1510)
+                data[3] = struct.pack("<B", 0x10)
+                data[4] = struct.pack("<B", PySolarmanV5._get_response_code(CONTROL.REQUEST))
                 try:
                     checksum = self.sol._calculate_v5_frame_checksum(bytes(data))
                 except:
@@ -185,7 +179,8 @@ async def stream_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             sol.sequence_number = data[5]
             log.debug(f"[AioHandler] RECD: {data}")
             data = bytearray(data)
-            data[3:5] = struct.pack("<H", 0x1510)
+            data[3] = struct.pack("<B", 0x10)
+            data[4] = struct.pack("<B", PySolarmanV5._get_response_code(CONTROL.REQUEST))
             try:
                 checksum = sol._calculate_v5_frame_checksum(bytes(data))
             except:

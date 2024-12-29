@@ -1,12 +1,14 @@
 """pysolarmanv5.py"""
 
+import time
 import errno
 import queue
+import types
 import struct
 import socket
 import logging
-import selectors
 import platform
+import selectors
 
 from threading import Thread, Event
 from multiprocessing import Queue
@@ -19,6 +21,15 @@ from umodbus.exceptions import error_code_to_exception_map
 
 
 _WIN_PLATFORM = platform.system() == "Windows"
+
+
+CONTROL = types.SimpleNamespace()
+CONTROL.HANDSHAKE = 0x41
+CONTROL.DATA = 0x42
+CONTROL.INFO = 0x43
+CONTROL.REQUEST = 0x45
+CONTROL.HEARTBEAT = 0x47
+CONTROL.REPORT = 0x48
 
 
 class V5FrameError(Exception):
@@ -110,9 +121,10 @@ class PySolarmanV5:
         # Define and construct V5 request frame structure.
         self.v5_start = bytes.fromhex("A5")
         self.v5_length = bytes.fromhex("0000")  # placeholder value
-        self.v5_controlcode = struct.pack("<H", 0x4510)
-        self.v5_serial = bytes.fromhex("0000")  # placeholder value
-        self.v5_loggerserial = struct.pack("<I", self.serial)
+        self.v5_magic = bytes.fromhex("10")
+        self.v5_control_codes = CONTROL.__dict__.values()
+        self.v5_seq = bytes.fromhex("0000")  # placeholder value
+        self.v5_serial = struct.pack("<I", self.serial)
         self.v5_frametype = bytes.fromhex("02")
         self.v5_sensortype = bytes.fromhex("0000")
         self.v5_deliverytime = bytes.fromhex("00000000")
@@ -133,8 +145,17 @@ class PySolarmanV5:
         self._socket_setup(kwargs.get("socket"), kwargs.get("auto_reconnect", False))
 
     @staticmethod
-    def _calculate_v5_frame_checksum(frame):
-        """Calculate checksum on all frame bytes except head, end and checksum
+    def _get_response_code(code: int) -> int:
+        """
+        Get response control code from request control code
+        
+        """
+        return code - 0x30
+
+    @staticmethod
+    def _calculate_v5_frame_checksum(frame: bytes) -> int:
+        """
+        Calculate checksum on all frame bytes except head, end and checksum
 
         :param frame: V5 frame
         :type frame: bytes
@@ -147,8 +168,30 @@ class PySolarmanV5:
             checksum += frame[i] & 0xFF
         return int(checksum & 0xFF)
 
-    def _get_next_sequence_number(self):
-        """Get the next sequence number for use in outgoing packets
+    def _v5_header(self, length: int, control: int, seq: bytes) -> bytearray:
+        """
+        Construct V5 header
+        
+        """
+        return bytearray(
+            self.v5_start
+            + struct.pack("<H", length)
+            + self.v5_magic
+            + struct.pack("<B", control)
+            + seq
+            + self.v5_serial
+        )
+
+    def _v5_trailer(self) -> bytearray:
+        """
+        Construct V5 trailer
+
+        """
+        return bytearray(self.v5_checksum + self.v5_end)
+
+    def _get_next_sequence_number(self) -> int:
+        """
+        Get the next sequence number for use in outgoing packets
 
         If ``sequence_number`` is None, generate a random int as initial value.
 
@@ -162,8 +205,9 @@ class PySolarmanV5:
             self.sequence_number = (self.sequence_number + 1) & 0xFF
         return self.sequence_number
 
-    def _v5_frame_encoder(self, modbus_frame):
-        """Take a modbus RTU frame and encode it in a V5 data logging stick frame
+    def _v5_frame_encoder(self, modbus_frame: bytes) -> bytearray:
+        """
+        Take a modbus RTU frame and encode it in a V5 data logging stick frame
 
         :param modbus_frame: Modbus RTU frame
         :type modbus_frame: bytes
@@ -171,17 +215,12 @@ class PySolarmanV5:
         :rtype: bytearray
 
         """
+        length = 15 + len(modbus_frame)
 
-        self.v5_length = struct.pack("<H", 15 + len(modbus_frame))
-        self.v5_serial = struct.pack("<H", self._get_next_sequence_number())
+        self.v5_length = struct.pack("<H", length)
+        self.v5_seq = struct.pack("<H", self._get_next_sequence_number())
 
-        v5_header = bytearray(
-            self.v5_start
-            + self.v5_length
-            + self.v5_controlcode
-            + self.v5_serial
-            + self.v5_loggerserial
-        )
+        v5_header = self._v5_header(length, CONTROL.REQUEST, self.v5_seq)
 
         v5_payload = bytearray(
             self.v5_frametype
@@ -192,15 +231,13 @@ class PySolarmanV5:
             + modbus_frame
         )
 
-        v5_trailer = bytearray(self.v5_checksum + self.v5_end)
-
-        v5_frame = v5_header + v5_payload + v5_trailer
-
-        v5_frame[len(v5_frame) - 2] = self._calculate_v5_frame_checksum(v5_frame)
+        v5_frame = v5_header + v5_payload + self._v5_trailer()
+        v5_frame[-2] = self._calculate_v5_frame_checksum(v5_frame)
         return v5_frame
 
-    def _v5_frame_decoder(self, v5_frame):
-        """Decodes a V5 data logging stick frame and returns a modbus RTU frame
+    def _v5_frame_decoder(self, v5_frame: bytes) -> bytearray:
+        """
+        Decodes a V5 data logging stick frame and returns a modbus RTU frame
 
         Modbus RTU frame will start at position 25 through ``len(v5_frame)-2``.
 
@@ -240,21 +277,21 @@ class PySolarmanV5:
                 frame_len = frame_len_without_payload_len + payload_len
 
         if (v5_frame[0] != int.from_bytes(self.v5_start, byteorder="big")) or (
-            v5_frame[frame_len - 1] != int.from_bytes(self.v5_end, byteorder="big")
+            v5_frame[-1] != int.from_bytes(self.v5_end, byteorder="big")
         ):
             raise V5FrameError("V5 frame contains invalid start or end values")
-        if v5_frame[frame_len - 2] != self._calculate_v5_frame_checksum(v5_frame):
+        if v5_frame[-2] != self._calculate_v5_frame_checksum(v5_frame):
             raise V5FrameError("V5 frame contains invalid V5 checksum")
         if v5_frame[5] != self.sequence_number:
             raise V5FrameError("V5 frame contains invalid sequence number")
-        if v5_frame[7:11] != self.v5_loggerserial:
+        if v5_frame[7:11] != self.v5_serial:
             raise V5FrameError("V5 frame contains incorrect data logger serial number")
-        if v5_frame[3:5] != struct.pack("<H", 0x1510):
+        if v5_frame[4] != self._get_response_code(CONTROL.REQUEST):
             raise V5FrameError("V5 frame contains incorrect control code")
         if v5_frame[11] != int("02", 16):
             raise V5FrameError("V5 frame contains invalid frametype")
 
-        modbus_frame = v5_frame[25 : frame_len - 2]
+        modbus_frame = v5_frame[25:-2]
 
         if len(modbus_frame) < 5:
             if len(modbus_frame) > 0 and (
@@ -265,8 +302,23 @@ class PySolarmanV5:
 
         return modbus_frame
 
-    def _send_receive_v5_frame(self, data_logging_stick_frame):
-        """Send v5 frame to the data logger and receive response
+    def _v5_time_response_frame(self, frame: bytes) -> bytearray:
+        """
+        Creates time response frame
+
+        """
+        response_frame = self._v5_header(10, self._get_response_code(frame[4]), frame[5:7]) + bytearray(
+            + struct.pack("<H", 0x0100) # Frame & sensor type?
+            + struct.pack("<I", int(time.time()))
+            + struct.pack("<I", 0) # Offset?
+        ) + self._v5_trailer()
+        response_frame[5] = (response_frame[5] + 1) & 0xFF
+        response_frame[-2] = self._calculate_v5_frame_checksum(response_frame)
+        return response_frame
+
+    def _send_receive_v5_frame(self, data_logging_stick_frame: bytes) -> bytes:
+        """
+        Send v5 frame to the data logger and receive response
 
         :param data_logging_stick_frame: V5 frame to transmit
         :type data_logging_stick_frame: bytes
@@ -298,10 +350,11 @@ class PySolarmanV5:
         self.log.debug("[%s] RECD: %s", self.serial, v5_response.hex(" "))
         return v5_response
 
-    def _received_frame_is_valid(self, frame):
-        """Check that the frame is valid and that the serial number of the received
-        frame matches with the last sent one.
-        Ignore also any frames with control code 0x4710 (counter frame).
+    def _received_frame_is_valid(self, frame: bytes) -> bool:
+        """
+        Check that the frame is valid and that the serial number of the received
+        frame matches with the last sent one
+
         """
         if not frame.startswith(self.v5_start):
             self.log.debug("[%s] V5_MISMATCH: %s", self.serial, frame.hex(" "))
@@ -309,10 +362,34 @@ class PySolarmanV5:
         if frame[5] != self.sequence_number:
             self.log.debug("[%s] V5_SEQ_NO_MISMATCH: %s", self.serial, frame.hex(" "))
             return False
-        if frame.startswith(self.v5_start + b"\x01\x00\x10\x47"):
-            self.log.debug("[%s] COUNTER: %s", self.serial, frame.hex(" "))
-            return False
         return True
+
+    def _received_frame_response(self, frame: bytes) -> tuple[bool, bytearray]:
+        """
+        Return response to frames with control codes 0x41 (handshake), 0x42 (data), 0x43 (wifi), 0x47 (heartbeat) and 0x48 (report)
+
+        """
+        do_continue = True
+        response_frame = None
+        if frame[4] != CONTROL.REQUEST and frame[4] in self.v5_control_codes:
+            do_continue = False
+            # Maybe do_continue = True for CONTROL.DATA|INFO|REPORT and thus process packets in the future?
+            control_name = [i for i in CONTROL.__dict__ if CONTROL.__dict__[i]==frame[4]][0]
+            self.log.debug("[%s] V5_%s: %s", self.serial, control_name, frame.hex(" "))
+            response_frame = self._v5_time_response_frame(frame)
+            self.log.debug("[%s] V5_%s RESP: %s", self.serial, control_name, response_frame.hex(" "))
+        return do_continue, response_frame
+
+    def _handle_protocol_frame(self, frame: bytes) -> bool:
+        """
+        Handles frames with known control codes :func:`_received_frame_response() <pysolarmanv5.PySolarmanV5._received_frame_response>`
+
+        """
+        do_continue, response_frame = self._received_frame_response(frame)
+        if response_frame is not None:
+            if self._reader_thr.is_alive():
+                self.sock.sendall(response_frame)
+        return do_continue
 
     def _data_receiver(self):
         self._poll.register(self.sock.fileno(), selectors.EVENT_READ)
@@ -349,6 +426,8 @@ class PySolarmanV5:
                         self._reconnect()
                     return
                 if not self._received_frame_is_valid(data):
+                    continue
+                if not self._handle_protocol_frame(data):
                     continue
                 if self._data_wanted.is_set():
                     self._data_queue.put(data, timeout=self.socket_timeout)
